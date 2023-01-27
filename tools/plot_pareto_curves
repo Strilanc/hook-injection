@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+
+import argparse
+import pathlib
+from typing import List, Optional, Any
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+import matplotlib.colors
+
+
+COLORS = list(matplotlib.colors.TABLEAU_COLORS.values())
+MARKERS: str = "ov*sp^<>8PhH+xXDd|" * 100
+
+
+def expected_error_rate(stat: sinter.TaskStats) -> Optional[float]:
+    num_kept = stat.shots - stat.discards
+    if num_kept == 0 or stat.errors == 0:
+        return None
+    return stat.errors / num_kept
+
+
+def expected_error_rate_stddev(stat: sinter.TaskStats) -> Optional[float]:
+    if stat.errors < 2:
+        return None
+    p = expected_error_rate(stat)
+    n = stat.shots - stat.discards
+    return np.sqrt(p*(1-p) / n)
+
+
+def expected_cost(stat: sinter.TaskStats) -> Optional[float]:
+    num_kept = stat.shots - stat.discards
+    if num_kept == 0:
+        return None
+    expected_shots_per_keep = stat.shots / num_kept
+    marginal_cost_per_attempt = stat.json_metadata['post_q'] * stat.json_metadata['post_r']
+    return marginal_cost_per_attempt * expected_shots_per_keep
+
+
+def pareto_boundary(stats: List[sinter.TaskStats]) -> List[sinter.TaskStats]:
+    points = []
+    for stat in stats:
+        if stat.errors < 100:
+            # Not certain enough.
+            continue
+        err_rate = expected_error_rate(stat)
+        cost = expected_cost(stat)
+        if err_rate is None or cost is None:
+            continue
+        points.append((cost, err_rate, stat))
+    points = sorted(points)
+    pareto_points = []
+    err_floor = 1
+    for cost, err_rate, stat in points:
+        if err_rate < err_floor:
+            pareto_points.append(stat)
+            err_floor = err_rate
+    return pareto_points
+
+
+def plot_boundary_curve(ax: plt.Axes, xs: List[float], ys: List[float], color: Any):
+    curve_xs = [x
+                for x in xs
+                for _ in range(2)]
+    curve_ys = [y
+                for y in ys
+                for _ in range(2)]
+    curve_xs.pop(0)
+    curve_ys.pop()
+    curve_xs.append(10**20)
+    curve_ys.append(curve_ys[-1])
+    curve_xs.insert(0, curve_xs[0])
+    curve_ys.insert(0, 1)
+    ax.plot(curve_xs, curve_ys, color=color)
+
+
+def name(stat: sinter.TaskStats) -> str:
+    s = stat.json_metadata['b'].split('_inject')[0]
+    s = s.replace('li', 'Li')
+    s = s.replace('pregrown_hook', 'hook (pregrown)')
+    s = s.replace('zz_tweaked', 'ZZ (tweaked)')
+    s = s.replace('zz', 'ZZ')
+    s += str(stat.json_metadata.get('v', ''))
+    return s
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stats",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--show",
+        default=False,
+        action='store_true',
+    )
+    parser.add_argument(
+        "--gates",
+        choices=['cz', 'all'],
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+    )
+    args = parser.parse_args()
+
+    stats = sinter.stats_from_csv_files(args.stats)
+    if args.out is not None:
+        out = pathlib.Path(args.out)
+        out.parent.mkdir(exist_ok=True, parents=True)
+    else:
+        out = None
+
+    ax: plt.Axes
+    fig: plt.Figure
+    fig, ax = plt.subplots(1, 1)
+    target_basis = 'Y'
+    target_state = '|i>' if target_basis == 'Y' else '|+>' if target_basis == 'X' else '|0>'
+    target_distance = 15
+    target_rounds = 15
+    target_p = 0.001
+    target_noise = 'SI1000' if args.gates == 'cz' else 'UniformDepolarizing'
+    target_gates = args.gates
+    stats = [
+        stat
+        for stat in stats
+        if stat.json_metadata['p'] == target_p
+        if f'inject_{target_basis}' in stat.json_metadata['b']
+        if 'magic' in stat.json_metadata['b']
+        if 'cphase' not in stat.json_metadata['b']
+        if stat.json_metadata['noise'] == target_noise
+        if stat.json_metadata['d'] == target_distance
+        if stat.json_metadata['r'] == target_rounds
+        if stat.json_metadata['gates'] == target_gates
+    ]
+    group: List[sinter.TaskStats]
+    for k, (_, group) in enumerate(sorted(sinter.group_by(stats, key=lambda e: ('li' not in e.json_metadata['b'], name(e))).items())):
+        boundary = pareto_boundary(group)
+        if not boundary:
+            continue
+        xs = []
+        ys = []
+        err_ys = []
+        for stat in boundary:
+            x = expected_cost(stat)
+            y = expected_error_rate(stat)
+            err_y = expected_error_rate_stddev(stat)
+            assert x is not None
+            assert y is not None
+            assert err_y is not None
+            xs.append(x)
+            ys.append(y)
+            err_ys.append(err_y)
+            m = stat.json_metadata
+            note = f'''{m['post_r']},{m['post_d']}'''
+            ax.annotate(
+                note,
+                (x, y),
+                xytext=(-3, -3),
+                textcoords='offset pixels',
+                fontsize=8,
+                horizontalalignment='right',
+                verticalalignment='top',
+                color=COLORS[k],
+            )
+
+        plot_boundary_curve(ax, xs, ys, color=COLORS[k])
+
+        ax.errorbar(xs, ys, yerr=err_ys, label=f'''{name(boundary[0])} injection''', marker=MARKERS[k], color=COLORS[k], linewidth=0, elinewidth=1, capsize=2, capthick=1)
+
+    p = 1e-3
+    low = p*7/30 + 56*p**2
+    ax.plot([1e0, 1e6], [low, low], linestyle=':', color='k', label='7p/30 + 56p² limit for |i⟩')
+    ax.loglog()
+    ax.grid(which='minor')
+    ax.grid(which='major', color='black')
+    ax.set_title(f'Error-vs-cost frontier of different injection strategies\n(state={target_state},d={target_distance},r_hold={target_rounds},p={target_p},noise={target_noise},gates={target_gates},check=noiseless)')
+    ax.set_ylabel('Error Rate (after postselection)')
+    ax.set_xlabel('Expected qubit*rounds cost including retries')
+    ax.set_ylim(1e-4, 1e-2)
+    ax.set_xlim(1e1, 1e5)
+    ax.legend(loc='lower left')
+
+    if args.show or (out is None):
+        plt.show()
+    if out is not None:
+        fig.set_dpi(100)
+        fig.set_size_inches(10, 10)
+        fig.tight_layout()
+        fig.savefig(out)
+
+
+if __name__ == '__main__':
+    main()

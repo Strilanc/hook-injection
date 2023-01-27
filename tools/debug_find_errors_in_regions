@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import pathlib
+from typing import Callable, Optional
+
+from hookinj import gen
+from hookinj._make_circuit import make_circuit
+
+
+def analyze_case(*,
+                 case: str,
+                 is_vulnerable: Callable[[complex], bool],
+                 show_board: bool = False,
+                 out: Optional[pathlib.Path],
+                 rb: int,
+                 d: int):
+    p = 1e-3
+    err = 'DEPOLARIZE1'
+    circuit = make_circuit(
+        basis='Y',
+        noise=gen.NoiseModel(
+            idle_depolarization=p,
+            any_clifford_1q_rule=gen.NoiseRule(after={err: p}),
+            any_clifford_2q_rule=gen.NoiseRule(after={"DEPOLARIZE2": p}),
+            measure_rules={
+                'X': gen.NoiseRule(after={err: p}),
+                'Y': gen.NoiseRule(after={err: p}),
+                'Z': gen.NoiseRule(after={err: p}),
+            },
+            gate_rules={
+                'RX': gen.NoiseRule(after={err: p}),
+                'RY': gen.NoiseRule(after={err: p}),
+                'R': gen.NoiseRule(after={err: p}),
+            }
+        ),
+        boundary_rounds=rb,
+        memory_rounds=d,
+        distance=d,
+        verify_chunks=True,
+        convert_to_cz=False,
+        debug_out_dir=out if show_board else None,
+    )
+
+    try:
+        err = circuit.shortest_graphlike_error(canonicalize_circuit_errors=True)
+    except ValueError:
+        err = []
+    used = {r + 1j*i for r, i in circuit.get_final_qubit_coordinates().values()}
+    hit = collections.Counter()
+    bases = collections.defaultdict(set)
+    for e in err:
+        for loc in e.circuit_error_locations:
+            for p in loc.flipped_pauli_product:
+                r, i = p.coords
+                q = r + 1j*i
+                hit[q] *= 1000
+                hit[q] = loc.tick_offset
+                bases[q].add("X" if p.gate_target.is_x_target else "Y" if p.gate_target.is_y_target else "Z")
+
+    xs = sorted({q.real for q in used})
+    ys = sorted({q.imag for q in used})
+
+    print("NONE" if len(err) == 0 else len(err), case)
+    if show_board or (len(err) and len(err) < d):
+        print("{")
+        for y in ys:
+            print("    ", end="")
+            for x in xs:
+                q = x + 1j*y
+                if q not in used:
+                    print("  ", end="")
+                elif not is_vulnerable(q):
+                    print(" .", end="")
+                elif q in hit:
+                    if len(bases[q]) == 1:
+                        b, = bases[q]
+                        if hit[q] == 1:
+                            print(" " + b, end="")
+                        else:
+                            print(b + str(hit[q]), end="")
+                    else:
+                        print(" " + str(hit[q]), end="")
+                else:
+                    print(" ~", end="")
+            print()
+        print("}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug_out_dir", default=None, type=str)
+    args = parser.parse_args()
+    out = None if args.debug_out_dir is None else pathlib.Path(args.debug_out_dir)
+
+    d = 9
+    b = d // 2 - 1
+    W = b + 5
+    analyze_case(case="R______", rb=W, d=d, out=out, is_vulnerable=lambda q: q.real > 3)
+    analyze_case(case="L______", rb=W, d=d, out=out, is_vulnerable=lambda q: q.real < d - 3)
+    analyze_case(case="B______", rb=W, d=d, out=out, is_vulnerable=lambda q: q.imag > 3)
+    analyze_case(case="T______", rb=W, d=d, out=out, is_vulnerable=lambda q: q.imag < d - 3)
+    analyze_case(case="C______", rb=b, d=d, out=out, is_vulnerable=lambda q: 2 < q.real < d - 2 and 2 < q.imag < d - 2)
+    analyze_case(case="C_left_", rb=b, d=d, out=out, is_vulnerable=lambda q: q.real < d - 2 and 2 < q.imag < d - 2)
+    analyze_case(case="C_right", rb=b, d=d, out=out, is_vulnerable=lambda q: 2 < q.real and 2 < q.imag < d - 3)
+    analyze_case(case="C_up___", rb=b, d=d, out=out, is_vulnerable=lambda q: 2 < q.real < d - 2 and q.imag < d - 3)
+    analyze_case(case="C_down_", rb=b, d=d, out=out, is_vulnerable=lambda q: 2 < q.real < d - 2 and 2 < q.imag)
+    analyze_case(case="TL_____", rb=W, d=d, out=out, is_vulnerable=lambda q: q.imag < d - 2 and q.real < d - 2)
+    analyze_case(case="TR_____", rb=W, d=d, out=out, is_vulnerable=lambda q: q.imag < d - 2 and q.real > 3)
+    analyze_case(case="BL_____", rb=W, d=d, out=out, is_vulnerable=lambda q: q.imag > 3 and q.real < d - 2)
+    analyze_case(case="BR_____", rb=W, d=d, out=out, is_vulnerable=lambda q: q.imag > 3 and q.real > 3)
+    analyze_case(case="V_left_", rb=W, d=d, out=out, is_vulnerable=lambda q: 1 < q.real < 3)
+    analyze_case(case="H_top__", rb=W, d=d, out=out, is_vulnerable=lambda q: 1 < q.imag < 3)
+    analyze_case(case="V_right", rb=W, d=d, out=out, is_vulnerable=lambda q: d - 3 < q.real < d - 1)
+    analyze_case(case="H_bot__", rb=W, d=d, out=out, is_vulnerable=lambda q: d - 3 < q.imag < d - 1)
+    analyze_case(case="H_wide_", rb=W, d=d, out=out, is_vulnerable=lambda q: 2 < q.imag < d - 1)
+
+
+if __name__ == '__main__':
+    main()

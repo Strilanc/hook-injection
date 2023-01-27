@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import pathlib
+import tempfile
+from typing import Optional, Dict, List, AbstractSet, Set, Counter, Tuple
+
+import gqec
+import numpy as np
+import stim
+import matplotlib.pyplot as plt
+
+from hookinj._make_circuit import _write
+
+
+class Edge:
+    def __init__(self, a: int, b: Optional[int], mask: int):
+        self.a = a
+        self.b = b
+        self.mask = mask
+        assert b is None or a < b, f'{self}'
+
+    def __lt__(self, other):
+        return (self.a, -1 if self.b is None else self.b) < (other.a, -1 if other.b is None else other.b)
+
+    def __eq__(self, other):
+        return self.a == other.a and self.b == other.b
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.a, self.b))
+
+    def __repr__(self):
+        return f'Edge(a={self.a!r}, b={self.b!r}, mask={self.mask!r})'
+
+
+def _targets_to_edge_no_separator(targets: List[stim.DemTarget]) -> Edge:
+    flipped = 0
+    pair = []
+    for t in targets:
+        if t.is_logical_observable_id():
+            flipped ^= 1 << t.val
+        else:
+            assert t.is_relative_detector_id()
+            pair.append(t.val)
+    assert 1 <= len(pair) <= 2
+    if len(pair) == 1:
+        pair.append(None)
+    else:
+        pair = sorted(pair)
+    return Edge(pair[0], pair[1], flipped)
+
+
+def targets_to_edges(targets: List[stim.DemTarget]) -> List[Edge]:
+    edges = []
+    start = 0
+    while start < len(targets):
+        end = start + 1
+        while end < len(targets) and not targets[end].is_separator():
+            end += 1
+        edges.append(_targets_to_edge_no_separator(targets[start:end]))
+        start = end + 1
+    return edges
+
+
+def make_error_to_edges_list(dem: stim.DetectorErrorModel) -> List[List[Edge]]:
+    out = []
+    for inst in dem.flattened():
+        if inst.type == 'error':
+            out.append(targets_to_edges(inst.targets_copy()))
+    return out
+
+
+def nonzero_bit_packed(data: np.ndarray) -> np.ndarray:
+    return np.nonzero(np.unpackbits(data, bitorder='little'))[0]
+
+
+def sample_physical_errors_causing_logical_errors(
+        dem: stim.DetectorErrorModel,
+        *,
+        batch_size: int,
+        min_errors: int,
+) -> Tuple[int, np.ndarray]:
+    sampler = dem.compile_sampler()
+    num_errors = dem.num_errors
+
+    recorded_errors = []
+    num_shots = 0
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        dem_path = d / 'dem.dem'
+        dem.to_file(dem_path)
+        dets_path = d / 'dets.r8'
+        obs_actual_path = d / 'obs.actual.b8'
+        obs_predicted_path = d / 'obs.pred.b8'
+        err_path = d / 'err.r8'
+
+        while len(recorded_errors) < min_errors:
+            num_shots += batch_size
+            sampler.sample_write(
+                shots=batch_size,
+                det_out_file=dets_path,
+                det_out_format="r8",
+                obs_out_file=obs_actual_path,
+                obs_out_format="b8",
+                err_out_file=err_path,
+                err_out_format="r8",
+            )
+
+            gqec.run_finite_match_main(
+                dem_filepath=str(dem_path),
+                dets_filepath=str(dets_path),
+                dets_format="r8",
+                dets_has_observables=False,
+                ignore_distance_1_errors=False,
+                ignore_undecomposed_errors=False,
+                output_filepath=str(obs_predicted_path),
+                use_correlated_decoding=True,
+                output_type="predictions:b8",
+            )
+
+            actual_obs = np.fromfile(obs_actual_path, dtype=np.bool8)
+            predicted_obs = np.fromfile(obs_predicted_path, dtype=np.bool8)
+            shot_error_indices = list(np.nonzero(actual_obs ^ predicted_obs)[0])
+            if shot_error_indices:
+                err_data = stim.read_shot_data_file(path=err_path, format='r8', bit_packed=True,
+                                                    num_measurements=num_errors)
+                for e in shot_error_indices:
+                    recorded_errors.append(err_data[e])
+
+            print(len(recorded_errors), num_shots)
+
+    return num_shots, np.array(recorded_errors, dtype=np.uint8)
+
+
+def get_combined_error_and_prediction_edge_set(*, fi_prediction_line: str, edge_to_annotated_edge: Dict[Edge, Edge], recorded_errors: np.ndarray, error_to_edge_lists: List[List[Edge]]):
+    edge_set = collections.Counter()
+
+    for word in fi_prediction_line.split()[1:]:
+        a, b = word.split(':')
+        a = int(a)
+        if b == 'BOUNDARY':
+            b = None
+        else:
+            b = int(b)
+        edge = Edge(a=a, b=b, mask=0)
+        edge = edge_to_annotated_edge[edge]
+        edge_set[edge] += 1
+
+    for nonzero_index in nonzero_bit_packed(recorded_errors):
+        for edge in error_to_edge_lists[nonzero_index]:
+            edge_set[edge] += 1
+
+    return {e for e, n in edge_set.items() if n & 1}
+
+
+def edge_set_without_vacuous_components(edges: AbstractSet[Edge], *, node_to_edges: Dict[int, List[Edge]]) -> Set[Edge]:
+    involved = []
+    seen = set()
+    for edge in edges:
+        if not edge.mask or edge in seen:
+            continue
+        mask = 0
+        stack = [edge]
+        component = []
+        while stack:
+            e = stack.pop()
+            if e in seen or e not in edges:
+                continue
+            seen.add(e)
+            component.append(e)
+            mask ^= e.mask
+            stack.extend(node_to_edges[e.a])
+            if e.b is not None:
+                stack.extend(node_to_edges[e.b])
+        if mask:
+            involved.extend(component)
+    return set(involved)
+
+
+def get_logical_error_edge_sets(dem: stim.DetectorErrorModel, *, recorded_errors: np.ndarray) -> Counter[Edge]:
+    num_errors = dem.num_errors
+    sampler = dem.compile_sampler()
+
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        dem_path = d / 'dem.dem'
+        dem.to_file(dem_path)
+        dets_path = d / 'dets.r8'
+        obs_actual_path = d / 'obs.actual.b8'
+        obs_predicted_path = d / 'obs.pred.b8'
+        err_path = d / 'err.r8'
+
+        stim.write_shot_data_file(data=np.array(recorded_errors, dtype=np.uint8), path=err_path, format="r8", num_measurements=num_errors)
+        sampler.sample_write(
+            shots=len(recorded_errors),
+            det_out_file=dets_path,
+            det_out_format="r8",
+            obs_out_file=obs_actual_path,
+            obs_out_format="b8",
+            replay_err_in_file=err_path,
+            replay_err_in_format='r8',
+        )
+
+        gqec.run_finite_match_main(
+            dem_filepath=str(dem_path),
+            dets_filepath=str(dets_path),
+            dets_format="r8",
+            dets_has_observables=False,
+            ignore_distance_1_errors=False,
+            ignore_undecomposed_errors=False,
+            output_filepath=str(obs_predicted_path),
+            use_correlated_decoding=True,
+            output_type="predictions_with_match_edges",
+        )
+
+        error_to_edge_lists = make_error_to_edges_list(dem)
+        edge_to_annotated_edge = {edge: edge for edges in error_to_edge_lists for edge in edges}
+        node_to_edges = collections.defaultdict(list)
+        for edge in edge_to_annotated_edge.keys():
+            node_to_edges[edge.a].append(edge)
+            if edge.b is not None:
+                node_to_edges[edge.b].append(edge)
+
+        problem_edges = collections.Counter()
+        with open(obs_predicted_path) as f:
+            for k, line in enumerate(f):
+                all_involved_edges = get_combined_error_and_prediction_edge_set(
+                    fi_prediction_line=line,
+                    edge_to_annotated_edge=edge_to_annotated_edge,
+                    recorded_errors=recorded_errors[k],
+                    error_to_edge_lists=error_to_edge_lists,
+                )
+                relevant_edges = edge_set_without_vacuous_components(all_involved_edges, node_to_edges=node_to_edges)
+                problem_edges.update(relevant_edges)
+
+        return problem_edges
+
+
+def rgb_grad(p: float) -> str:
+    r, g, b, _ = plt.get_cmap('plasma')(1 - p, bytes=True)
+    r = hex(r)[2:].rjust(2, '0')
+    g = hex(g)[2:].rjust(2, '0')
+    b = hex(b)[2:].rjust(2, '0')
+    return '#' + r + g + b
+
+
+def draw_svg(*,
+             dem: stim.DetectorErrorModel,
+             det_hits: Counter[int],
+             edge_hits: Counter[Edge],
+             max_edge_hits_scale: Optional[int],
+             num_errors: int,
+             num_shots: int):
+    coords = dem.get_detector_coordinates()
+    edges = sorted(set(edge for edges in make_error_to_edges_list(dem) for edge in edges), key=lambda e: tuple(coords[e.a]))
+
+    def project(c: List[float]) -> complex:
+        return (c[0] + c[1]*1j + c[2] * (0.2 + 0.1j)) * 20
+
+    min_x = min(project(e).real for e in coords.values())
+    min_y = min(project(e).imag for e in coords.values())
+    max_x = max(project(e).real for e in coords.values())
+    max_y = max(project(e).imag for e in coords.values())
+    min_x -= 40
+    min_y -= 40
+    max_x += 40
+    max_y += 40
+    center = (min_x + max_x) / 2 + (min_y + max_y) / 2 * 1j
+
+    svg = [f"""<svg viewBox="{min_x} {min_y} {max_x - min_x} {max_y - min_y}" xmlns="http://www.w3.org/2000/svg">"""]
+
+    max_edge_hit = max_edge_hits_scale
+    if max_edge_hit is None:
+        max_edge_hit = max((h // 2 if e.b is None else h for e, h in edge_hits.items()), default=0)
+    for e in edges:
+        a = project(coords[e.a])
+        if e.b is None:
+            b = a - center
+            if abs(b) > 0:
+                b /= abs(b)
+            b *= 40
+            b += a
+        else:
+            b = project(coords[e.b])
+        h = edge_hits[e]
+        if e.b is None:
+            h //= 2
+        c = (h + 1) / (max_edge_hit + 1)
+        r = max(0.01, (h + 1) / (max_edge_hit + 1))
+        svg.append(f'<path '
+                   f'd="M {a.real} {a.imag} L {b.real} {b.imag}" '
+                   f'fill="none" '
+                   f'stroke-width="{r}" '
+                   f'stroke="{rgb_grad(c)}" />')
+
+    max_node_hit = max(det_hits.values(), default=0)
+    for k, v in coords.items():
+        p = project(v)
+        h = det_hits[k]
+        c = (h + 1) / (max_node_hit + 2)
+        r = max(0.1, (h + 10) / (max_node_hit + 20)) * 2
+        svg.append(f'<circle '
+                   f'cx="{p.real}" '
+                   f'cy="{p.imag}" '
+                   f'r="{r}" '
+                   f'fill="{rgb_grad(c)}" '
+                   f'stroke="none" />')
+
+    if max_edge_hit > 100:
+        num_per_bucket = (max_edge_hit + 49) // 50
+        num_buckets = 50
+    else:
+        num_per_bucket = 1
+        num_buckets = max(max_edge_hit + 1, 2)
+    max_hit = num_buckets * num_per_bucket
+    bucket_width = 50 / num_buckets
+    bucket_height_scale = 1
+    buckets = [0] * num_buckets
+    base_x = 20
+    base_y = -35
+    svg.append(f'<path d="M {base_x} {base_y} {base_x + num_buckets * bucket_width} {base_y}" fill="none" stroke="black" stroke-width="0.1" />')
+    for e, h in edge_hits.items():
+        if e.b is None:
+            h /= 2
+        buckets[int(h // num_per_bucket)] += 1
+
+    ss = sum(buckets)
+    def f(rr):
+        return np.log((rr + 1) / (ss + len(buckets) - 1) * len(buckets))
+
+    for k in range(num_buckets):
+        c = ((k + 0.5) / num_buckets * (max_edge_hit + 1) + 1) / (max_edge_hit + 1)
+        x = base_x + (k + 0.5)*bucket_width
+        svg.append(f'<path d="M {x} {base_y - (f(buckets[k]) - f(0)) * bucket_height_scale} L {x} {base_y}" fill="none" stroke="{rgb_grad(c)}" stroke-width="{bucket_width}" />')
+        rgb_grad(c)
+    svg.append('<text'
+        f' x="{base_x}"'
+        f' y="{base_y + 1}"'
+        ' fill="black"'
+        ' font-size="6"'
+        ' text-anchor="start"'
+        ' alignment-baseline="hanging"'
+        '>0</text>')
+    svg.append('<text'
+        f' x="{base_x + bucket_width*num_buckets}"'
+        f' y="{base_y + 1}"'
+        ' fill="black"'
+        ' font-size="6"'
+        ' text-anchor="end"'
+        ' alignment-baseline="hanging"'
+        f'>{max_hit}</text>')
+    svg.append('<text'
+        f' x="{base_x + bucket_width*num_buckets/2}"'
+        f' y="{base_y + 1}"'
+        ' fill="black"'
+        ' font-size="6"'
+        ' text-anchor="middle"'
+        ' alignment-baseline="hanging"'
+        f'>edge_hits</text>')
+    svg.append('<text'
+        f' x="{base_x - 2}"'
+        f' y="{base_y - 2}"'
+        ' fill="black"'
+        ' font-size="6"'
+        ' text-anchor="end"'
+        ' alignment-baseline="bottom"'
+        f'>log freq</text>')
+    svg.append('<text'
+               f' x="{base_x + bucket_width*num_buckets + 2}"'
+               f' y="{base_y - 5}"'
+               ' fill="black"'
+               ' font-size="6"'
+               ' text-anchor="start"'
+               ' alignment-baseline="hanging"'
+               f'>errors={num_errors}</text>')
+    svg.append('<text'
+               f' x="{base_x + bucket_width*num_buckets + 2}"'
+               f' y="{base_y - 6}"'
+               ' fill="black"'
+               ' font-size="6"'
+               ' text-anchor="start"'
+               ' alignment-baseline="bottom"'
+               f'>shots={num_shots}</text>')
+
+    svg.append("</svg>")
+    return "\n".join(svg)
+
+
+def run_for_circuit(
+    *,
+    circuit: stim.Circuit,
+    out: pathlib.Path,
+    stats_out: Optional[pathlib.Path],
+    batch_size: int,
+    max_edge_hits_scale: Optional[int],
+    error_batch_size: int,
+    min_errors: int,
+):
+    dem = circuit.detector_error_model(decompose_errors=True)
+
+    edge_hits = collections.Counter()
+    det_hits = collections.Counter()
+    for edge_list in make_error_to_edges_list(dem):
+        for edge in edge_list:
+            edge_hits[edge] = 0
+    for k in range(dem.num_detectors):
+        det_hits[k] = 0
+    total_errors = 0
+    total_shots = 0
+    while total_errors < min_errors:
+        cur_num_shots, recorded_errors = sample_physical_errors_causing_logical_errors(dem, batch_size=batch_size, min_errors=error_batch_size)
+        total_errors += len(recorded_errors)
+        total_shots += cur_num_shots
+        edge_hits.update(get_logical_error_edge_sets(dem, recorded_errors=recorded_errors))
+        for err in recorded_errors:
+            det_hits.update(nonzero_bit_packed(err))
+        hist = collections.Counter()
+        for e, c in sorted(edge_hits.items(), key=lambda e: e[1]):
+            hist[c] += 1
+        worst = max(hist.keys(), default=0)
+
+        kept = stim.DetectorErrorModel()
+        for e, c in edge_hits.items():
+            if c > worst // 2:
+                targets = [stim.DemTarget.relative_detector_id(e.a)]
+                if e.b is not None:
+                    targets.append(stim.DemTarget.relative_detector_id(e.b))
+                if e.mask:
+                    targets.append(stim.DemTarget.logical_observable_id(0))
+                kept.append(stim.DemInstruction(type='error', args=[0.1], targets=targets))
+
+        if stats_out is not None:
+            _write(stats_out, f"""{total_shots=!r}
+{total_errors=!r}
+{det_hits=!r}
+{edge_hits=!r}
+""")
+        _write(out, draw_svg(dem=dem, det_hits=det_hits, edge_hits=edge_hits, num_errors=total_errors, num_shots=total_shots, max_edge_hits_scale=max_edge_hits_scale))
+        print(f"{total_shots=!r}")
+        print(f"{total_errors=!r}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--circuit", type=str, default=None)
+    parser.add_argument("--out", type=str, required=True)
+    parser.add_argument("--stats_out", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=2**16)
+    parser.add_argument("--min_errors", type=int, default=10000)
+    parser.add_argument("--max_edge_hits_scale", type=int, default=None)
+    args = parser.parse_args()
+
+    circuit = stim.Circuit.from_file(args.circuit)
+
+    run_for_circuit(
+        circuit=circuit,
+        out=pathlib.Path(args.out),
+        stats_out=None if args.stats_out is None else pathlib.Path(args.stats_out),
+        batch_size=args.batch_size,
+        error_batch_size=10,
+        min_errors=args.min_errors,
+        max_edge_hits_scale=args.max_edge_hits_scale,
+    )
+
+
+if __name__ == '__main__':
+    main()

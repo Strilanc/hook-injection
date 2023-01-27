@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+
+import argparse
+import itertools
+import pathlib
+from typing import List, Optional, Any, Dict
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+import matplotlib.colors
+from sinter._main_plot import _ax_log_helper
+
+COLORS = list(matplotlib.colors.TABLEAU_COLORS.values())
+MARKERS: str = "ov*sp^<>8PhH+xXDd|" * 100
+
+
+def expected_error_rate(stat: sinter.TaskStats) -> Optional[float]:
+    num_kept = stat.shots - stat.discards
+    if num_kept == 0 or stat.errors == 0:
+        return None
+    return stat.errors / num_kept
+
+
+def expected_error_rate_stddev(stat: sinter.TaskStats) -> Optional[float]:
+    if stat.errors < 2:
+        return None
+    p = expected_error_rate(stat)
+    n = stat.shots - stat.discards
+    return np.sqrt(p*(1-p) / n)
+
+
+def expected_cost(stat: sinter.TaskStats) -> Optional[float]:
+    num_kept = stat.shots - stat.discards
+    if num_kept == 0:
+        return None
+    expected_shots_per_keep = stat.shots / num_kept
+    marginal_cost_per_attempt = stat.json_metadata['post_q'] * stat.json_metadata['post_r']
+    return marginal_cost_per_attempt * expected_shots_per_keep
+
+
+def pareto_boundary(stats: List[sinter.TaskStats]) -> List[sinter.TaskStats]:
+    points = []
+    for stat in stats:
+        if stat.errors < 100:
+            # Not certain enough.
+            continue
+        err_rate = expected_error_rate(stat)
+        cost = expected_cost(stat)
+        if err_rate is None or cost is None:
+            continue
+        points.append((cost, err_rate, stat))
+    points = sorted(points)
+    pareto_points = []
+    err_floor = 1
+    for cost, err_rate, stat in points:
+        if err_rate < err_floor:
+            pareto_points.append(stat)
+            err_floor = err_rate
+    return pareto_points
+
+
+def plot_boundary_curve(ax: plt.Axes, xs: List[float], ys: List[float], color: Any):
+    curve_xs = [x
+                for x in xs
+                for _ in range(2)]
+    curve_ys = [y
+                for y in ys
+                for _ in range(2)]
+    curve_xs.pop(0)
+    curve_ys.pop()
+    curve_xs.append(10**20)
+    curve_ys.append(curve_ys[-1])
+    curve_xs.insert(0, curve_xs[0])
+    curve_ys.insert(0, 1)
+    ax.plot(curve_xs, curve_ys, color=color)
+
+
+def name(stat: sinter.TaskStats) -> str:
+    s = stat.json_metadata['b'].split('_inject')[0]
+    s = s.replace('li', 'Li')
+    s = s.replace('pregrown_hook', 'hook (pregrown)')
+    s = s.replace('zz_tweaked', 'ZZ (tweaked)')
+    s = s.replace('zz', 'ZZ')
+    s += str(stat.json_metadata.get('v', ''))
+    return s
+
+
+def filter_func(stat: sinter.TaskStats) -> bool:
+    m = stat.json_metadata
+    decoder = stat.decoder
+    return m['b'].startswith('hook_inject_') and m['noise'] == 'SI1000' and m['post_r'] == 2 and m['post_d'] in [5, 7] and m['d'] == m['r'] == 15 and 'magic' not in m['b']
+
+
+def group_func(stat: sinter.TaskStats) -> str:
+    m = stat.json_metadata
+    return f'''inject_d={m['post_d']} state={'|i⟩' if 'Y' in m['b'] else '|+⟩'}'''
+
+
+def plot_args_func(index: int, key: Any, stats: List[sinter.TaskStats]) -> Dict[str, Any]:
+    stat = stats[0]
+    return {
+        'color': 'C0' if stat.json_metadata['post_d'] == 5 else 'C1',
+        'marker': 'v' if 'Y' in stat.json_metadata['b'] else '+',
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stats",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--show",
+        default=False,
+        action='store_true',
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+    )
+    args = parser.parse_args()
+
+    all_stats = sinter.stats_from_csv_files(args.stats)
+    if args.out is not None:
+        out = pathlib.Path(args.out)
+        out.parent.mkdir(exist_ok=True, parents=True)
+    else:
+        out = None
+
+    plotted_stats: List['sinter.TaskStats'] = [
+        stat
+        for stat in all_stats
+        if filter_func(stat)
+    ]
+    x_func = lambda stat: stat.json_metadata['p']
+
+    fig: plt.Figure
+    ax_err: plt.Axes
+    ax_dis: plt.Axes
+    fig, (ax_err, ax_dis) = plt.subplots(1, 2)
+
+    ax_err.loglog()
+    ax_dis.semilogx()
+
+    xs = []
+    ys1 = []
+    ys2 = []
+    for p in np.logspace(-4, -2, 100):
+        xs.append(p)
+        ys1.append(7*p/30 + 56*p**2)
+        ys2.append(5*p/30 + 21*p**2)
+    ax_err.plot(xs, ys1, color='black', linestyle=':', label='7p/30 + 56p² limit for |i⟩')
+    ax_err.plot(xs, ys2, color='black', linestyle='--', label='5p/30 + 21p² limit for |+⟩')
+
+    def err_rate(stat: sinter.TaskStats) -> sinter.Fit:
+        return sinter.fit_binomial(
+            num_shots=stat.shots - stat.discards,
+            num_hits=stat.errors,
+            max_likelihood_factor=1e3,
+        )
+
+    for d in [5, 7]:
+        xs = []
+        ys1_best = []
+        ys2_best = []
+        ys1_high = []
+        ys2_low = []
+        s1 = [stat for stat in plotted_stats if stat.json_metadata['post_d'] == d and 'Y' in stat.json_metadata['b']]
+        s2 = [stat for stat in plotted_stats if stat.json_metadata['post_d'] == d and not 'Y' in stat.json_metadata['b']]
+        s1 = sorted(s1, key=x_func)
+        s2 = sorted(s2, key=x_func)
+        for v1, v2 in zip(s1, s2):
+            assert x_func(v1) == x_func(v2)
+            xs.append(x_func(v1))
+            e1 = err_rate(v1)
+            e2 = err_rate(v2)
+            ys1_best.append(e1.best)
+            ys2_best.append(e2.best)
+            ys1_high.append(e1.high)
+            ys2_low.append(e2.low)
+        color = 'C0' if d == 5 else 'C1'
+        ax_err.plot(xs, ys1_best, color=color, label=f'inject_d={d} state=|i⟩', marker='v', linestyle='-')
+        ax_err.plot(xs, ys2_best, color=color, label=f'inject_d={d} state=|+⟩', marker='+', linestyle='')
+        ax_err.fill_between(xs, ys1_high, ys2_low, color=color, alpha=0.2)
+
+    min_y = 1e-5
+    major_tick_steps = 1
+    while 10**-major_tick_steps >= min_y * 0.1:
+        major_tick_steps += 1
+    ax_err.set_yticks([10**-d for d in range(major_tick_steps)])
+    ax_err.set_yticks([b*10**-d for d in range(1, major_tick_steps) for b in range(2, 10)], minor=True)
+    ax_err.set_ylim(min_y, 1e-0)
+    ax_err.set_ylabel('Injection Error Rate (per kept shot)')
+    ax_err.grid(which='major', color='#000000')
+    ax_err.grid(which='minor', color='#DDDDDD')
+    ax_err.legend()
+
+    sinter.plot_discard_rate(
+        ax=ax_dis,
+        stats=plotted_stats,
+        group_func=group_func,
+        x_func=x_func,
+        highlight_max_likelihood_factor=1e3,
+        plot_args_func=plot_args_func,
+    )
+
+    ax_dis.set_yticks([p / 10 for p in range(11)], labels=[f'{10*p}%' for p in range(11)])
+    ax_dis.set_ylim(0, 1)
+    ax_dis.grid(which='minor')
+    ax_dis.grid(which='major', color='black')
+    ax_dis.set_ylabel(f"Discard Rate (per shot)")
+    ax_dis.legend()
+    ax_dis.set_xlim(1e-4, 1e-2)
+    ax_err.set_xlim(1e-4, 1e-2)
+
+    ax_err.set_xlabel("Noise Strength (p)")
+    ax_dis.set_xlabel("Noise Strength (p)")
+
+    ax_err.set_title(f'Injection Error Rate vs Noise Strength\n(inject=hook, inject_r=2, d=15, r_hold=15, noise=SI1000)')
+    ax_dis.set_title(f'Discard Rate vs Noise Strength\n(inject=hook, inject_r=2, d=15, r_hold=15, noise=SI1000)')
+
+    if args.show or (out is None):
+        plt.show()
+    fig.set_size_inches(20, 10)
+    fig.tight_layout()
+    if out is not None:
+        fig.set_dpi(100)
+        fig.savefig(out)
+
+    axs = [e for e in [ax_err, ax_dis] if e is not None]
+
+    return fig, axs
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import itertools
+from typing import Tuple, FrozenSet, Iterable
+
+import stim
+
+from hookinj import gen
+from hookinj._make_circuit import make_circuit, CONSTRUCTIONS
+
+
+def dem_error_symptoms(inst: stim.DemInstruction) -> Tuple[int, FrozenSet[int]]:
+    targets = inst.targets_copy()
+    logical_mask = 0
+    detectors = set()
+
+    for t in targets:
+        if t.is_relative_detector_id():
+            if t.val in detectors:
+                detectors.remove(t.val)
+            else:
+                detectors.add(t.val)
+        elif t.is_logical_observable_id():
+            logical_mask ^= 1 << t.val
+    return logical_mask, frozenset(detectors)
+
+
+def bernoulli_add(p1: float, p2: float) -> float:
+    return p1 * (1 - p2) + p2 * (1 - p1)
+
+
+def approx_pair_probability(probabilities: Iterable[float]) -> float:
+    probabilities = list(probabilities)
+    n = len(probabilities)
+    t = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            t = bernoulli_add(t, probabilities[i] * probabilities[j])
+    return t
+
+
+def bernoulli_sum(probs: Iterable[float]) -> float:
+    p = 0
+    for p2 in probs:
+        p = bernoulli_add(p, p2)
+    return p
+
+
+def calc_case(circuit: stim.Circuit):
+    dem = circuit.detector_error_model()
+    d1_errs, = circuit.explain_detector_error_model_errors(dem_filter=stim.DetectorErrorModel("""
+        error(0.1) L0
+    """))
+    num_d1 = len(d1_errs.circuit_error_locations)
+    p_d1 = 0
+
+    d2_groups = collections.defaultdict(lambda: collections.defaultdict(float))
+    d2_dem_err_groups = collections.defaultdict(lambda: collections.defaultdict(stim.DetectorErrorModel))
+
+    for inst in dem.flattened():
+        if inst.type != "error":
+            continue
+        p = inst.args_copy()[0]
+        logi, dets = dem_error_symptoms(inst)
+        if len(dets) == 0 and logi != 0:
+            p_d1 = bernoulli_add(p_d1, p)
+        else:
+            d2_dem_err_groups[dets][logi].append(inst)
+            d2_groups[dets][logi] = bernoulli_add(d2_groups[dets][logi], p)
+
+    d2_dem_errs = stim.DetectorErrorModel()
+    for d2_group in d2_dem_err_groups.values():
+        if len(d2_group) > 1:
+            for d2_dem in d2_group.values():
+                d2_dem_errs += d2_dem
+    d2_circuit_errs = circuit.explain_detector_error_model_errors(dem_filter=d2_dem_errs)
+    num_d2 = sum(len(e.circuit_error_locations) for e in d2_circuit_errs)
+
+    p_d2 = 0
+    for d2_group in d2_groups.values():
+        if len(d2_group) > 1:
+            p_pair = approx_pair_probability(d2_group.values())
+            p_d2 = bernoulli_add(p_pair, p_d2)
+
+    return f'    {num_d1=}, {num_d2=}, e1={p_d1}, e2={p_d2}, e1+e2={bernoulli_add(p_d1, p_d2)}'
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--distance", nargs='+', required=True, type=int)
+    parser.add_argument("--memory_rounds", nargs='+', required=True, type=str)
+    parser.add_argument("--postselected_rounds", nargs='+', required=True, type=str)
+    parser.add_argument("--postselected_diameter", nargs='+', required=True, type=str)
+    parser.add_argument("--noise_strength", nargs='+', required=True, type=float)
+    parser.add_argument("--noise_model", nargs='+', required=True, choices=['SI1000', 'UniformDepolarizing', 'None'])
+    parser.add_argument("--basis", nargs='+', required=True, choices=CONSTRUCTIONS.keys())
+    parser.add_argument("--convert_to_cz", nargs='+', default=('auto',))
+    args = parser.parse_args()
+
+    for (distance,
+         noise_strength,
+         postselected_rounds_func,
+         postselected_diameter_func,
+         memory_rounds_func,
+         noise_model_name,
+         basis,
+         convert_to_cz_arg) in itertools.product(
+            args.distance,
+            args.noise_strength,
+            args.postselected_rounds,
+            args.postselected_diameter,
+            args.memory_rounds,
+            args.noise_model,
+            args.basis,
+            args.convert_to_cz):
+        if noise_model_name == "SI1000":
+            noise_model = gen.NoiseModel.si1000(noise_strength)
+        elif noise_model_name == "UniformDepolarizing":
+            noise_model = gen.NoiseModel.uniform_depolarizing(noise_strength)
+        elif noise_model_name == "None":
+            noise_model = None
+        else:
+            raise NotImplementedError(f'{noise_model_name=}')
+
+        postselected_rounds = eval(postselected_rounds_func, {'d': distance})
+        postselected_diameter = eval(postselected_diameter_func, {'d': distance})
+        memory_rounds = eval(memory_rounds_func, {'d': distance})
+        if convert_to_cz_arg == 'auto':
+            convert_to_cz = noise_model_name == 'SI1000'
+        else:
+            convert_to_cz = bool(int(convert_to_cz_arg))
+        circuit = make_circuit(
+            basis=basis,
+            distance=distance,
+            noise=noise_model,
+            debug_out_dir=None,
+            postselected_rounds=postselected_rounds,
+            postselected_diameter=postselected_diameter,
+            memory_rounds=memory_rounds,
+            convert_to_cz=convert_to_cz,
+        )
+        q = circuit.num_qubits
+        extra_tags = ''
+        if convert_to_cz:
+            extra_tags += ',gates=cz'
+        else:
+            extra_tags += ',gates=all'
+        if 'inject' in basis:
+            extra_tags += f',post_q={gen.estimate_qubit_count_during_postselection(circuit)}'
+        path = f'r={memory_rounds},d={distance},p={noise_strength},noise={noise_model_name},b={basis},post_r={postselected_rounds},post_d={postselected_diameter},q={q}{extra_tags}'
+
+        print(path)
+        print(calc_case(circuit))
+
+
+if __name__ == '__main__':
+    main()
