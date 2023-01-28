@@ -99,9 +99,11 @@ def group_func(stat: sinter.TaskStats) -> str:
 
 def plot_args_func(index: int, key: Any, stats: List[sinter.TaskStats]) -> Dict[str, Any]:
     stat = stats[0]
+    m = stat.json_metadata
+    d = m['post_d']
     return {
-        'color': 'C0' if stat.json_metadata['post_d'] == 5 else 'C1',
-        'marker': 'v' if 'Y' in stat.json_metadata['b'] else '+',
+        'color': 'C0' if d == 5 else 'C1',
+        'marker': 'v' if 'Y' in m['b'] and d == 5 else '^' if 'Y' in m['b'] and d == 7 else '+' if d == 7 else 'x',
     }
 
 
@@ -183,8 +185,8 @@ def main():
             ys1_high.append(e1.high)
             ys2_low.append(e2.low)
         color = 'C0' if d == 5 else 'C1'
-        ax_err.plot(xs, ys1_best, color=color, label=f'inject_d={d} state=|i⟩', marker='v', linestyle='-')
-        ax_err.plot(xs, ys2_best, color=color, label=f'inject_d={d} state=|+⟩', marker='+', linestyle='')
+        ax_err.plot(xs, ys2_best, color=color, label=f'inject_d={d} state=|+⟩', marker='+' if d == 5 else 'x', linestyle='')
+        ax_err.plot(xs, ys1_best, color=color, label=f'inject_d={d} state=|i⟩', marker='v' if d == 5 else '^', linestyle='-')
         ax_err.fill_between(xs, ys1_high, ys2_low, color=color, alpha=0.2)
 
     min_y = 1e-5
